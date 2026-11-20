@@ -1,3 +1,6 @@
+# git worktree 工作目录
+/.worktrees/
+
 # 构建产物
 /bin/
 /dist/
