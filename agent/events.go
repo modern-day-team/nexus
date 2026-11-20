@@ -6,10 +6,12 @@ import (
 	"io"
 	"strings"
 
-	"github.com/cloudwego/eino/components/tool"
 	einoagent "github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/schema"
 )
+
+// 本文件聚集流式事件：事件类型、emitter 管道与 ChatStreamEvents 主循环。
+// 工具的事件包装见 observe.go。
 
 // EventType 标识流式事件类型。
 type EventType string
@@ -85,49 +87,6 @@ func (s eventSink) emit(ev Event) {
 	}
 }
 
-// observedInvokableTool 在工具执行前后发出事件。未提供 emitter 时行为与原始工具一致。
-type observedInvokableTool struct {
-	tool.InvokableTool
-}
-
-func (t *observedInvokableTool) InvokableRun(
-	ctx context.Context, argumentsInJSON string, opts ...tool.Option,
-) (string, error) {
-	name := ""
-	if info, err := t.InvokableTool.Info(ctx); err == nil && info != nil {
-		name = info.Name
-	}
-
-	emitEvent(ctx, Event{Type: EventToolStart, ToolName: name, Arguments: argumentsInJSON})
-
-	out, err := t.InvokableTool.InvokableRun(ctx, argumentsInJSON, opts...)
-
-	emitEvent(ctx, Event{
-		Type:      EventToolEnd,
-		ToolName:  name,
-		Arguments: argumentsInJSON,
-		Result:    out,
-		Err:       err,
-	})
-	return out, err
-}
-
-// observeTools 为实现了 InvokableTool 的工具加上事件包装，其余工具保持不变。
-func observeTools(tools []tool.BaseTool) []tool.BaseTool {
-	if len(tools) == 0 {
-		return tools
-	}
-	out := make([]tool.BaseTool, len(tools))
-	for i, t := range tools {
-		if invokable, ok := t.(tool.InvokableTool); ok {
-			out[i] = &observedInvokableTool{InvokableTool: invokable}
-			continue
-		}
-		out[i] = t
-	}
-	return out
-}
-
 // ChatStreamEvents 发送一条用户消息并以事件流方式返回模型输出与工具调用过程。
 //
 // 事件契约：EventDone 是最后一个事件，到达时本轮会话历史已写入；
@@ -136,13 +95,13 @@ func observeTools(tools []tool.BaseTool) []tool.BaseTool {
 func (a *Agent) ChatStreamEvents(
 	ctx context.Context, input string, opts ...einoagent.AgentOption,
 ) (*schema.StreamReader[Event], error) {
-	if err := a.beginTurn(ctx); err != nil {
+	if err := a.turn.begin(ctx); err != nil {
 		return nil, err
 	}
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 
@@ -153,12 +112,12 @@ func (a *Agent) ChatStreamEvents(
 
 	modelStream, err := a.inner.Stream(runCtx, msgs, opts...)
 	if err != nil {
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 	if err := a.session.Append(runCtx, schema.UserMessage(input)); err != nil {
 		modelStream.Close()
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 
@@ -168,7 +127,7 @@ func (a *Agent) ChatStreamEvents(
 	go drainEvents(writer, events, runDone)
 
 	go func() {
-		defer a.endTurn()
+		defer a.turn.end()
 		defer modelStream.Close()
 		defer close(runDone)
 

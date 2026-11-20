@@ -1,5 +1,16 @@
 // Package agent 实现基于 Eino ReAct 的 Agent 内核。
 //
+// 文件职责划分（低耦合高内聚）：
+//
+//	agent.go       内核：构建、轮次编排、请求消息组装
+//	turn.go        轮次串行化信号量
+//	session.go     Session 接口与内存实现
+//	filesession.go 文件持久化 Session 实现
+//	observe.go     工具包装器：审批与事件观测
+//	events.go      流式事件类型与 ChatStreamEvents
+//	retry.go       模型调用重试
+//	compact.go     请求前历史压缩
+//
 // 用法：
 //
 //	a, err := agent.New(ctx, agent.Options{ChatModel: cm, Tools: tools})
@@ -53,8 +64,8 @@ type Agent struct {
 	session      Session
 	compactor    Compactor
 
-	// turn 是容量为 1 的信号量，用于串行化轮次。
-	turn chan struct{}
+	// turn 串行化轮次。
+	turn turnGate
 }
 
 // New 构建 Agent。
@@ -68,10 +79,9 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	}
 
 	inner, err := react.NewAgent(ctx, &react.AgentConfig{
-		// 审批钩子在内层（先问询），事件观测在外层（放行后才发工具事件）。
 		ToolCallingModel: newRetryingModel(opts.ChatModel, opts.Retry),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: observeTools(applyApproval(opts.Tools, opts.ToolApprover)),
+			Tools: setupTools(opts.Tools, opts.ToolApprover),
 		},
 		MaxStep: maxStep,
 	})
@@ -89,16 +99,16 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		systemPrompt: opts.SystemPrompt,
 		session:      session,
 		compactor:    opts.Compactor,
-		turn:         make(chan struct{}, 1),
+		turn:         newTurnGate(),
 	}, nil
 }
 
 // Chat 发送一条用户消息并等待完整回复，同时把本轮对话写入会话。
 func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentOption) (*schema.Message, error) {
-	if err := a.beginTurn(ctx); err != nil {
+	if err := a.turn.begin(ctx); err != nil {
 		return nil, err
 	}
-	defer a.endTurn()
+	defer a.turn.end()
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
@@ -121,24 +131,24 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 func (a *Agent) ChatStream(
 	ctx context.Context, input string, opts ...einoagent.AgentOption,
 ) (*schema.StreamReader[*schema.Message], error) {
-	if err := a.beginTurn(ctx); err != nil {
+	if err := a.turn.begin(ctx); err != nil {
 		return nil, err
 	}
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 
 	stream, err := a.inner.Stream(ctx, msgs, opts...)
 	if err != nil {
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
 		stream.Close()
-		a.endTurn()
+		a.turn.end()
 		return nil, err
 	}
 
@@ -146,7 +156,7 @@ func (a *Agent) ChatStream(
 	out, internal := copies[0], copies[1]
 
 	go func() {
-		defer a.endTurn()
+		defer a.turn.end()
 		defer internal.Close()
 
 		msg, err := schema.ConcatMessageStream(internal)
@@ -167,26 +177,12 @@ func (a *Agent) History(ctx context.Context) ([]*schema.Message, error) {
 
 // Reset 清空当前会话。若存在进行中的轮次，Reset 会等待其结束后再清空。
 func (a *Agent) Reset(ctx context.Context) error {
-	if err := a.beginTurn(ctx); err != nil {
+	if err := a.turn.begin(ctx); err != nil {
 		return err
 	}
-	defer a.endTurn()
+	defer a.turn.end()
 
 	return a.session.Clear(ctx)
-}
-
-// beginTurn 获取本轮执行权，保证同一实例上的轮次串行。
-func (a *Agent) beginTurn(ctx context.Context) error {
-	select {
-	case a.turn <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (a *Agent) endTurn() {
-	<-a.turn
 }
 
 // requestMessages 组合系统提示词、会话历史与本次用户输入。
