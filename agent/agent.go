@@ -11,6 +11,7 @@
 //	retry.go       模型调用重试
 //	compact.go     请求前历史压缩
 //	usagehook.go   每轮用量回调钩子
+//	trace.go       可观测 trace 钩子
 //
 // 用法：
 //
@@ -57,6 +58,9 @@ type Options struct {
 	// UsageHook 在每轮对话结束后被回调，携带本轮 token 用量，可为空（不回调）。
 	// 见 UsageHook。
 	UsageHook UsageHook
+	// TraceHook 在每轮开始/结束与每次工具调用结束时被回调，可为空（不回调）。
+	// 见 TraceHook。
+	TraceHook TraceHook
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
@@ -68,6 +72,7 @@ type Agent struct {
 	session      Session
 	compactor    Compactor
 	usageHook    UsageHook
+	traceHook    TraceHook
 
 	// turn 串行化轮次。
 	turn turnGate
@@ -105,6 +110,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		session:      session,
 		compactor:    opts.Compactor,
 		usageHook:    opts.UsageHook,
+		traceHook:    opts.TraceHook,
 		turn:         newTurnGate(),
 	}, nil
 }
@@ -116,20 +122,27 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 	}
 	defer a.turn.end()
 
+	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	ctx = withTrace(ctx, a.traceHook)
+	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
 	reply, err := a.inner.Generate(ctx, msgs, opts...)
 	if err != nil {
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
 	if err := a.session.Append(ctx, schema.UserMessage(input), finalAssistantMessage(reply)); err != nil {
 		return reply, fmt.Errorf("agent: 写入会话历史失败: %w", err)
 	}
-	a.notifyUsage(ctx, usageFromMeta(reply.ResponseMeta))
+	usage := usageFromMeta(reply.ResponseMeta)
+	a.notifyUsage(ctx, usage)
+	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage})
 	return reply, nil
 }
 
@@ -142,20 +155,27 @@ func (a *Agent) ChatStream(
 		return nil, err
 	}
 
+	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	ctx = withTrace(ctx, a.traceHook)
+	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
+
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
 	stream, err := a.inner.Stream(ctx, msgs, opts...)
 	if err != nil {
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
 		stream.Close()
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
@@ -168,11 +188,14 @@ func (a *Agent) ChatStream(
 
 		msg, err := schema.ConcatMessageStream(internal)
 		if err != nil {
+			a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 			return
 		}
 		// 历史写入不随请求 ctx 取消，避免调用方取消后历史永久缺失。
 		_ = a.session.Append(context.WithoutCancel(ctx), finalAssistantMessage(msg))
-		a.notifyUsage(ctx, usageFromMeta(msg.ResponseMeta))
+		usage := usageFromMeta(msg.ResponseMeta)
+		a.notifyUsage(ctx, usage)
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage})
 	}()
 
 	return out, nil

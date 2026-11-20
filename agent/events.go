@@ -102,25 +102,32 @@ func (a *Agent) ChatStreamEvents(
 		return nil, err
 	}
 
+	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	ctx = withTrace(ctx, a.traceHook)
+	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
+
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
 	events := make(chan Event, 64)
 	runDone := make(chan struct{})
 	sink := eventSink{ch: events, done: runDone}
-	runCtx := withEmitter(ctx, sink.emit)
+	runCtx := withEmitter(withTrace(ctx, a.traceHook), sink.emit)
 
 	modelStream, err := a.inner.Stream(runCtx, msgs, opts...)
 	if err != nil {
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 	if err := a.session.Append(runCtx, schema.UserMessage(input)); err != nil {
 		modelStream.Close()
 		a.turn.end()
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
 		return nil, err
 	}
 
@@ -177,6 +184,7 @@ func (a *Agent) ChatStreamEvents(
 
 		// 在发 Done 之前回调用量钩子，保证钩子先于调用方收到本轮结束信号。
 		a.notifyUsage(ctx, usage)
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage, Err: streamErr})
 
 		sink.emit(Event{Type: EventDone, Usage: usage, Err: streamErr})
 	}()
