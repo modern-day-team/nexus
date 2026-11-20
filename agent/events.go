@@ -150,12 +150,7 @@ func (a *Agent) ChatStreamEvents(
 			}
 
 			if meta := chunk.ResponseMeta; meta != nil && meta.Usage != nil {
-				usage = &Usage{
-					PromptTokens:     meta.Usage.PromptTokens,
-					CompletionTokens: meta.Usage.CompletionTokens,
-					TotalTokens:      meta.Usage.TotalTokens,
-					CachedTokens:     meta.Usage.PromptTokenDetails.CachedTokens,
-				}
+				usage = usageFromMeta(meta)
 			}
 			if chunk.ReasoningContent != "" {
 				reasoning.WriteString(chunk.ReasoningContent)
@@ -176,6 +171,9 @@ func (a *Agent) ChatStreamEvents(
 		if appendErr != nil && streamErr == nil {
 			streamErr = appendErr
 		}
+
+		// 在发 Done 之前回调用量钩子，保证钩子先于调用方收到本轮结束信号。
+		a.notifyUsage(ctx, usage)
 
 		sink.emit(Event{Type: EventDone, Usage: usage, Err: streamErr})
 	}()
