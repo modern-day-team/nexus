@@ -10,6 +10,7 @@
 //	events.go      流式事件类型与 ChatStreamEvents
 //	retry.go       模型调用重试
 //	compact.go     请求前历史压缩
+//	usagehook.go   每轮用量回调钩子
 //
 // 用法：
 //
@@ -53,6 +54,9 @@ type Options struct {
 	Retry *RetryOptions
 	// ToolApprover 在每次工具调用前被询问，可为空（全部放行）。
 	ToolApprover ToolApprover
+	// UsageHook 在每轮对话结束后被回调，携带本轮 token 用量，可为空（不回调）。
+	// 见 UsageHook。
+	UsageHook UsageHook
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
@@ -63,6 +67,7 @@ type Agent struct {
 	systemPrompt string
 	session      Session
 	compactor    Compactor
+	usageHook    UsageHook
 
 	// turn 串行化轮次。
 	turn turnGate
@@ -99,6 +104,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		systemPrompt: opts.SystemPrompt,
 		session:      session,
 		compactor:    opts.Compactor,
+		usageHook:    opts.UsageHook,
 		turn:         newTurnGate(),
 	}, nil
 }
@@ -123,6 +129,7 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 	if err := a.session.Append(ctx, schema.UserMessage(input), finalAssistantMessage(reply)); err != nil {
 		return reply, fmt.Errorf("agent: 写入会话历史失败: %w", err)
 	}
+	a.notifyUsage(ctx, usageFromMeta(reply.ResponseMeta))
 	return reply, nil
 }
 
@@ -165,6 +172,7 @@ func (a *Agent) ChatStream(
 		}
 		// 历史写入不随请求 ctx 取消，避免调用方取消后历史永久缺失。
 		_ = a.session.Append(context.WithoutCancel(ctx), finalAssistantMessage(msg))
+		a.notifyUsage(ctx, usageFromMeta(msg.ResponseMeta))
 	}()
 
 	return out, nil
