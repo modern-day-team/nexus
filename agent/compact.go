@@ -47,9 +47,21 @@ func (c *TruncateCompactor) Compact(_ context.Context, msgs []*schema.Message) (
 		return msgs, nil
 	}
 
+	// 头部边界不能切开 assistant 工具调用与 tool 响应对：
+	// 若边界落在工具响应中间，或紧邻的前一条是带工具调用的 assistant
+	// （其 tool 响应将被丢进截断区），则向前收缩头部边界。
+	headKeep := c.KeepHead
+	for headKeep > 0 && headKeep < len(msgs) &&
+		(msgs[headKeep].Role == schema.Tool || len(msgs[headKeep-1].ToolCalls) > 0) {
+		headKeep--
+	}
+
 	keepTail := c.MaxMessages - c.KeepHead
 	// 找到尾部窗口的起点：最早且距末尾不超过 keepTail 的 user 消息。
 	start := len(msgs) - keepTail
+	if start < headKeep {
+		start = headKeep
+	}
 	for i := start; i < len(msgs); i++ {
 		if msgs[i].Role == schema.User {
 			// 继续向前看是否还有更早的 user 消息在窗口内，
@@ -58,26 +70,37 @@ func (c *TruncateCompactor) Compact(_ context.Context, msgs []*schema.Message) (
 			break
 		}
 	}
-	// 窗口内没有 user 消息边界可对齐（如连续工具调用），再多丢一些，
-	// 丢到紧邻位置的前一个 user 消息处；找不到就整段丢弃头部保留区之外的内容。
-	if msgs[start].Role != schema.User {
-		for i := start; i >= 0; i-- {
+	// 窗口内没有 user 消息边界可对齐（如结尾是一段连续工具调用）：
+	// 向前回退会把头部保留区之外的消息重复保留、撑爆条数预算，
+	// 因此直接丢弃整个尾段窗口；整段历史完全找不到 user 边界则返回 error。
+	found := start < len(msgs) && msgs[start].Role == schema.User
+	if !found {
+		hasUser := false
+		for i := 0; i < len(msgs); i++ {
 			if msgs[i].Role == schema.User {
-				start = i
+				hasUser = true
 				break
 			}
 		}
-	}
-	if msgs[start].Role != schema.User {
-		return nil, fmt.Errorf("agent: 历史压缩失败：%d 条消息中找不到 user 边界", len(msgs))
+		if !hasUser {
+			return nil, fmt.Errorf("agent: 历史压缩失败：%d 条消息中找不到 user 边界", len(msgs))
+		}
+		start = len(msgs)
 	}
 
-	out := make([]*schema.Message, 0, c.KeepHead+len(msgs)-start)
-	out = append(out, msgs[:c.KeepHead]...)
+	if start == len(msgs) {
+		// 无尾段可保留：仅返回完整头部前缀与截断说明。
+		notice := schema.UserMessage(fmt.Sprintf(
+			"[系统提示] 早期 %d 条历史消息已因超出上下文限制被截断。", len(msgs)-headKeep))
+		return append(msgs[:headKeep:headKeep], notice), nil
+	}
+
+	out := make([]*schema.Message, 0, headKeep+len(msgs)-start+1)
+	out = append(out, msgs[:headKeep]...)
 	// 插入一条说明性 user 消息，告知模型早期上下文已被截断，
 	// 同时充当尾段消息 tool/user 约束的缓冲边界。
 	notice := schema.UserMessage(fmt.Sprintf(
-		"[系统提示] 早期 %d 条历史消息已因超出上下文限制被截断。", start-c.KeepHead))
+		"[系统提示] 早期 %d 条历史消息已因超出上下文限制被截断。", start-headKeep))
 	out = append(out, notice)
 	out = append(out, msgs[start:]...)
 	return out, nil
