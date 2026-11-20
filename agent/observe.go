@@ -82,6 +82,15 @@ func (t *observedInvokableTool) InvokableRun(ctx context.Context, argumentsInJSO
 
 	out, err := t.InvokableTool.InvokableRun(ctx, argumentsInJSON, opts...)
 
+	// 工具级 trace 事件：hook 由 ctx 传入（见 trace.go withTrace/emitTrace）。
+	emitTrace(ctx, TraceEvent{
+		Kind:      TraceToolCall,
+		ToolName:  name,
+		Arguments: argumentsInJSON,
+		Result:    out,
+		Err:       err,
+	})
+
 	emitEvent(ctx, Event{
 		Type:      EventToolEnd,
 		ToolName:  name,
