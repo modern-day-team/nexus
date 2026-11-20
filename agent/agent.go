@@ -180,6 +180,11 @@ func (a *Agent) endTurn() {
 }
 
 // requestMessages 组合系统提示词、会话历史与本次用户输入。
+//
+// 消息顺序为 系统提示词 → 会话历史 → 本次输入，且历史只追加、不改写
+// （见 finalAssistantMessage），保证多轮间请求前缀字节级稳定，
+// 以命中模型服务商的 prompt cache，降低首 token 延迟与计费 token 数。
+// 调用方不应在 Agent 之外改写会话历史中的消息内容。
 func (a *Agent) requestMessages(ctx context.Context, input string) ([]*schema.Message, error) {
 	history, err := a.session.Messages(ctx)
 	if err != nil {
