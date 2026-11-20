@@ -14,8 +14,10 @@ go get github.com/modern-day-team/nexus
 
 ```
 .
-├── agent/    # 内核：ReAct 封装、Session 会话、流式事件
+├── agent/    # 内核：ReAct 封装、Session 会话、流式事件、委派、重试、审批、压缩
 ├── llm/      # 模型工厂：OpenAI 兼容 ChatModel（DeepSeek / Qwen / Ollama / vLLM 等）
+├── examples/ # 可运行示例：echo、delegation
+├── CHANGELOG.md
 ├── Makefile
 └── go.mod
 ```
@@ -102,6 +104,25 @@ func main() {
 - **历史压缩**（对应 Claude Code auto-compact）：`Compactor` 在每次请求前压缩历史，不回写会话。默认实现 `agent.NewTruncateCompactor(maxMessages, keepHead)`：保留开头固定上下文与最近消息，截断点对齐 user 边界以免切开工具调用对，并插入截断说明。
 - **模型重试**（对应 Codex 的 transient error retry）：`Retry: &agent.RetryOptions{MaxAttempts: 3, BaseDelay: 500ms, MaxDelay: 10s}`。指数退避 + 抖动，只重试未产出任何分片的失败，流建立后中断不重试。
 - **工具审批**（对应 Claude Code permission mode）：`ToolApprover` 在每次工具调用前被询问；返回错误即拒绝，拒绝原因作为工具结果反馈给模型（本轮不中断），模型可据此调整后续动作。
+- **token 压缩器**：`agent.NewTokenCompactor(maxTokens, keepHeadTokens)`，按估算 token 预算截断历史（`agent.EstimateTokens`），同样对齐 user 边界；与 `TruncateCompactor` 二选一。
+
+## 多 Agent 委派
+
+把子 Agent 包装成一个工具交给父 Agent，子 Agent 自持独立会话与工具集（历史跨多次委派保留）：
+
+```go
+sub, _ := agent.New(ctx, agent.Options{ChatModel: cm, Tools: timeTools})
+askTime, _ := agent.NewDelegationTool(agent.DelegationOptions{
+	Name:        "ask_time_agent",
+	Description: "向时间助手子 Agent 提问",
+	SubAgent:    sub,
+})
+parent, _ := agent.New(ctx, agent.Options{ChatModel: cm, Tools: []tool.BaseTool{askTime}})
+```
+
+## 示例
+
+[examples/](examples/) 下有两个可运行示例：`echo`（最小对话 + 本地工具 + 事件流）与 `delegation`（父 Agent 委派时间助手子 Agent），运行方式见 [examples/README.md](examples/README.md)。
 
 ## 事件契约
 

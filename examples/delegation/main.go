@@ -83,12 +83,15 @@ func main() {
 	}
 
 	// 4. 父 Agent：把子 Agent 包装成 ask_time_agent 工具传入。
-	//    依赖 feat/delegation 分支的 agent.NewDelegationTool。
-	askTimeTool := agent.NewDelegationTool(agent.DelegationOptions{
+	askTimeTool, err := agent.NewDelegationTool(agent.DelegationOptions{
 		Name:        "ask_time_agent",
 		Description: "向时间助手子 Agent 提问以查询当前时间",
 		SubAgent:    subAgent,
 	})
+	if err != nil {
+		fmt.Println("构建委派工具失败:", err)
+		os.Exit(1)
+	}
 	parentAgent, err := agent.New(ctx, agent.Options{
 		ChatModel:    cm,
 		Tools:        []tool.BaseTool{askTimeTool},
