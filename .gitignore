@@ -1,0 +1,26 @@
+# 构建产物
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 本地配置与密钥
+.env
+.env.*
+*.local
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.*
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
+Thumbs.db
