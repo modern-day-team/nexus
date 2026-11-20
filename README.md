@@ -14,8 +14,10 @@ go get github.com/modern-day-team/nexus
 
 ```
 .
-├── agent/    # 内核：ReAct 封装、Session 会话、流式事件、委派、重试、审批、压缩
-├── llm/      # 模型工厂：OpenAI 兼容 ChatModel（DeepSeek / Qwen / Ollama / vLLM 等）
+├── agent/    # 内核：ReAct 封装、Session 会话、流式事件、委派、重试、审批、压缩、结构化输出、trace 钩子
+├── llm/      # 模型工厂：OpenAI 兼容 ChatModel、DeepSeek 专项、fallback 链与熔断
+├── sessions/ # Session 参考实现：Redis、SQLite（跨进程恢复）
+├── otelx/    # OpenTelemetry GenAI 语义约定 trace 映射
 ├── examples/ # 可运行示例：echo、delegation
 ├── CHANGELOG.md
 ├── Makefile

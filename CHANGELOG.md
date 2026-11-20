@@ -1,5 +1,9 @@
 # 更新日志
 
+## v0.7.0
+- `agent.GenerateInto`：结构化输出——要求模型返回 JSON 并解析到任意 Go 类型，解析失败自动把错误反馈给模型重试（最多 3 轮，中间轮不落库），成功后与 Chat 同样的历史/UsageHook/Trace 语义。
+- `agent.ExtractJSON` / `agent.ErrNoJSON`：从模型输出中剥离 markdown 围栏与杂文本、提取 JSON 子串的导出工具。
+
 ## v0.6.0
 - `llm.NewFallbackModel`：多模型顺序降级链，每个候选独立熔断器（closed→open→half-open，连续失败达阈值熔断、冷却后半开恢复）；`Current()`/`OpenCircuits()` 观测；`WithTools` 派生共享熔断状态；流建立后不切换模型。
 
