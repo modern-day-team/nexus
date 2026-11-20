@@ -49,7 +49,7 @@ func main() {
 		ChatModel:    cm,
 		Tools:        myTools, // []tool.BaseTool，可为空
 		SystemPrompt: "你是一个助手",
-		Session:      agent.NewMemorySession(), // 可省略；也可实现 agent.Session 接入文件/数据库
+		Session:      agent.NewMemorySession(), // 可省略；持久化可用 agent.NewFileSession("chat.json")，或自行实现 agent.Session
 	})
 	if err != nil {
 		panic(err)
