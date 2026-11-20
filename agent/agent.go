@@ -115,6 +115,20 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	}, nil
 }
 
+// NewWithStore 在 Options 基础上从 store 取 conversationID 对应的 Session 注入。
+// opts.Session 会被覆盖。返回的 *Agent 使用完毕后由调用方管理 store 生命周期。
+func NewWithStore(ctx context.Context, store SessionStore, conversationID string, opts Options) (*Agent, error) {
+	if store == nil {
+		return nil, errors.New("agent: SessionStore 不能为空")
+	}
+	session, err := store.Session(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	opts.Session = session
+	return New(ctx, opts)
+}
+
 // Chat 发送一条用户消息并等待完整回复，同时把本轮对话写入会话。
 func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentOption) (*schema.Message, error) {
 	if err := a.turn.begin(ctx); err != nil {
