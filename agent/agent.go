@@ -58,7 +58,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	inner, err := react.NewAgent(ctx, &react.AgentConfig{
 		ToolCallingModel: opts.ChatModel,
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: opts.Tools,
+			Tools: observeTools(opts.Tools),
 		},
 		MaxStep: maxStep,
 	})

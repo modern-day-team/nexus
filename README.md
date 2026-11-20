@@ -36,6 +36,8 @@ export NEXUS_MODEL=qwen2.5:7b
 make run
 ```
 
+CLI 会以 `[thinking]`、`[tool]` 前缀实时展示模型思考与工具调用过程。
+
 Windows PowerShell：
 
 ```powershell
@@ -78,9 +80,26 @@ a, err := agent.New(ctx, agent.Options{
 
 reply, err := a.Chat(ctx, "你好")            // 一次性返回
 stream, err := a.ChatStream(ctx, "你好")     // 流式返回，需 Close
+
+// 事件流：同时获得正文分片、思考过程与工具调用过程
+events, err := a.ChatStreamEvents(ctx, "现在北京时间几点")
+for {
+	ev, err := events.Recv()
+	if errors.Is(err, io.EOF) {
+		break
+	}
+	switch ev.Type {
+	case agent.EventToken:     // ev.Content 正文分片
+	case agent.EventReasoning: // ev.Content 思考分片
+	case agent.EventToolStart: // ev.ToolName、ev.Arguments
+	case agent.EventToolEnd:   // ev.Result、ev.Err
+	case agent.EventError:     // ev.Err
+	}
+}
+events.Close()
 ```
 
-自定义工具可直接使用 Eino 的 `tool/utils.InferTool` 从结构体推断参数 schema，再传入 `agent.Options.Tools`。
+自定义工具可直接使用 Eino 的 `tool/utils.InferTool` 从结构体推断参数 schema，再传入 `agent.Options.Tools`。实现 `tool.InvokableTool` 的工具会被自动包装并上报 `tool_start` / `tool_end` 事件。
 
 ## CLI 命令
 

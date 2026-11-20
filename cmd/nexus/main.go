@@ -93,20 +93,61 @@ func run() error {
 }
 
 func streamChat(ctx context.Context, a *agent.Agent, input string) error {
-	stream, err := a.ChatStream(ctx, input)
+	stream, err := a.ChatStreamEvents(ctx, input)
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
 
+	inReasoning := false
 	for {
-		chunk, err := stream.Recv()
+		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			if inReasoning {
+				fmt.Println()
+			}
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		fmt.Print(chunk.Content)
+
+		switch ev.Type {
+		case agent.EventToken:
+			if inReasoning {
+				fmt.Println()
+				inReasoning = false
+			}
+			fmt.Print(ev.Content)
+		case agent.EventReasoning:
+			if !inReasoning {
+				fmt.Print("\n[thinking] ")
+				inReasoning = true
+			}
+			fmt.Print(ev.Content)
+		case agent.EventToolStart:
+			if inReasoning {
+				fmt.Println()
+				inReasoning = false
+			}
+			fmt.Printf("\n[tool] %s %s\n", ev.ToolName, truncate(ev.Arguments, 200))
+		case agent.EventToolEnd:
+			if ev.Err != nil {
+				fmt.Printf("[tool] %s 失败: %v\n", ev.ToolName, ev.Err)
+			} else {
+				fmt.Printf("[tool] %s → %s\n", ev.ToolName, truncate(ev.Result, 200))
+			}
+		case agent.EventError:
+			return ev.Err
+		}
 	}
+}
+
+func truncate(s string, limit int) string {
+	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + "..."
 }
