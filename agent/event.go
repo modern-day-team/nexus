@@ -105,8 +105,11 @@ func (a *Agent) ChatStreamEvents(
 	ctx context.Context, input string, opts ...einoagent.AgentOption,
 ) (*schema.StreamReader[Event], error) {
 	a.mu.Lock()
-	msgs := append(cloneMessages(a.history), schema.UserMessage(input))
-	a.mu.Unlock()
+	msgs, err := a.requestMessages(ctx, input)
+	if err != nil {
+		a.mu.Unlock()
+		return nil, err
+	}
 
 	events := make(chan Event, 64)
 	ctx = withEmitter(ctx, func(ev Event) {
@@ -118,11 +121,14 @@ func (a *Agent) ChatStreamEvents(
 
 	modelStream, err := a.inner.Stream(ctx, msgs, opts...)
 	if err != nil {
+		a.mu.Unlock()
 		return nil, err
 	}
-
-	a.mu.Lock()
-	a.history = append(a.history, schema.UserMessage(input))
+	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
+		a.mu.Unlock()
+		modelStream.Close()
+		return nil, err
+	}
 	a.mu.Unlock()
 
 	out, writer := schema.Pipe[Event](64)
@@ -166,13 +172,11 @@ func (a *Agent) ChatStreamEvents(
 		}
 		close(events)
 
-		a.mu.Lock()
-		a.history = append(a.history, &schema.Message{
+		_ = a.session.Append(ctx, &schema.Message{
 			Role:             schema.Assistant,
 			Content:          content.String(),
 			ReasoningContent: reasoning.String(),
 		})
-		a.mu.Unlock()
 	}()
 
 	return out, nil

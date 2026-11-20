@@ -76,11 +76,19 @@ func run() error {
 			fmt.Println("/help     查看命令\n/reset    清空会话历史\n/history  查看历史条数\n/exit     退出")
 			continue
 		case "/reset":
-			a.Reset()
-			fmt.Println("会话历史已清空")
+			if err := a.Reset(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			} else {
+				fmt.Println("会话历史已清空")
+			}
 			continue
 		case "/history":
-			fmt.Printf("当前历史 %d 条消息\n", len(a.History()))
+			history, err := a.History(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				continue
+			}
+			fmt.Printf("当前历史 %d 条消息\n", len(history))
 			continue
 		}
 

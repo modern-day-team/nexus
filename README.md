@@ -76,6 +76,7 @@ a, err := agent.New(ctx, agent.Options{
 	ChatModel:    cm,
 	Tools:        myTools, // []tool.BaseTool
 	SystemPrompt: "你是一个助手",
+	Session:      agent.NewMemorySession(), // 可省略；也可实现 agent.Session 接入文件/数据库
 })
 
 reply, err := a.Chat(ctx, "你好")            // 一次性返回
