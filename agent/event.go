@@ -35,6 +35,10 @@ type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	// CachedTokens 是本轮 prompt 中命中上下文缓存的 token 数。
+	// DeepSeek 等提供前缀缓存的模型会返回该值，可用于监控缓存命中率：
+	// CachedTokens / PromptTokens 越接近 1 越省时延与成本。
+	CachedTokens int
 }
 
 // Event 是 ChatStreamEvents 输出的流式事件。
@@ -191,6 +195,7 @@ func (a *Agent) ChatStreamEvents(
 					PromptTokens:     meta.Usage.PromptTokens,
 					CompletionTokens: meta.Usage.CompletionTokens,
 					TotalTokens:      meta.Usage.TotalTokens,
+					CachedTokens:     meta.Usage.PromptTokenDetails.CachedTokens,
 				}
 			}
 			if chunk.ReasoningContent != "" {

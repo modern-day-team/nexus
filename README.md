@@ -45,6 +45,13 @@ func main() {
 		panic(err)
 	}
 
+	// DeepSeek 专项工厂：思考模式、推理力度、上下文缓存命中率（Usage.CachedTokens）
+	// ds, err := llm.NewDeepSeek(ctx, llm.DeepSeekConfig{
+	// 	APIKey:          os.Getenv("DEEPSEEK_API_KEY"),
+	// 	Thinking:        ptr(true),          // 启用思考模式
+	// 	ReasoningEffort: "high",
+	// })
+
 	a, err := agent.New(ctx, agent.Options{
 		ChatModel:    cm,
 		Tools:        myTools, // []tool.BaseTool，可为空
@@ -81,6 +88,12 @@ func main() {
 	}
 }
 ```
+
+## DeepSeek V4.1-1017 专项适配
+
+- **工厂**：`llm.NewDeepSeek`，默认模型 `deepseek-flash`（V4.1-Flash-1017），支持 `Thinking`（思考模式）与 `ReasoningEffort`（推理力度 low/medium/high）。
+- **上下文缓存**：DeepSeek 的硬盘级上下文缓存按请求前缀自动命中。内核保证多轮间消息前缀字节级稳定（系统提示词 → 只追加的历史），无需额外配置即可命中；不要在内核外改写历史消息。
+- **命中率监控**：`ChatStreamEvents` 的 `EventDone.Usage.CachedTokens` 透出本轮命中缓存的 prompt token 数，`CachedTokens / PromptTokens` 即缓存命中率。
 
 ## 事件契约
 

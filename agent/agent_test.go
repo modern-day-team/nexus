@@ -106,7 +106,10 @@ func TestChatStreamEventsToolFlow(t *testing.T) {
 		Role:    schema.Assistant,
 		Content: "final",
 		ResponseMeta: &schema.ResponseMeta{
-			Usage: &schema.TokenUsage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8},
+			Usage: &schema.TokenUsage{
+				PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8,
+				PromptTokenDetails: schema.PromptTokenDetails{CachedTokens: 2},
+			},
 		},
 	}
 	toolCall := &schema.Message{
@@ -166,6 +169,9 @@ func TestChatStreamEventsToolFlow(t *testing.T) {
 	}
 	if done.Usage == nil || done.Usage.TotalTokens != 8 {
 		t.Fatalf("Done.Usage = %+v, want total 8", done.Usage)
+	}
+	if done.Usage.CachedTokens != 2 {
+		t.Fatalf("Done.Usage.CachedTokens = %d, want 2", done.Usage.CachedTokens)
 	}
 	if toolEndRes != "hi" {
 		t.Fatalf("工具结果 = %q, want hi", toolEndRes)
