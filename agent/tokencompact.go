@@ -115,6 +115,15 @@ func (c *TokenCompactor) Compact(_ context.Context, msgs []*schema.Message) ([]*
 		headEnd++
 	}
 
+	// 头部边界不能切开 assistant 工具调用与 tool 响应对：
+	// 若边界落在工具响应中间，或紧邻的前一条是带工具调用的 assistant
+	// （其 tool 响应将被丢进截断区），则向前收缩头部边界。
+	for headEnd > 1 && headEnd < len(msgs) &&
+		(msgs[headEnd].Role == schema.Tool || len(msgs[headEnd-1].ToolCalls) > 0) {
+		headEnd--
+	}
+	headTokens = EstimateMessagesTokens(msgs[:headEnd])
+
 	// 尾部：用剩余预算从末尾向前取整条消息。
 	tailBudget := c.MaxTokens - headTokens
 	start := len(msgs)
@@ -140,28 +149,40 @@ func (c *TokenCompactor) Compact(_ context.Context, msgs []*schema.Message) ([]*
 	}
 	// 对齐 user 边界：截断点必须落在 user 消息上，
 	// 避免把 assistant 工具调用与其 tool 响应切开。
-	// start == len(msgs) 表示尾段预算为 0，无尾段可对齐。
 	if start < len(msgs) && msgs[start].Role != schema.User {
 		// 先在窗口内向前找（多丢一些，取最早的 user 作为安全截断点）。
+		aligned := false
 		for i := start; i < len(msgs); i++ {
 			if msgs[i].Role == schema.User {
 				start = i
+				aligned = true
 				break
 			}
 		}
-		// 窗口内没有 user 边界（如连续工具调用），再丢一些，
-		// 向前找到紧邻位置之前最近的 user 消息处。
-		if msgs[start].Role != schema.User {
-			for i := start; i >= headEnd; i-- {
+		if !aligned {
+			// 窗口内没有 user 边界（如结尾是一段连续工具调用）。
+			// 向前回退会保留超出尾段预算的消息、撑爆 token 预算，
+			// 因此直接丢弃整个尾段窗口；头部保留区之后完全没有
+			// user 边界则按约定返回 error。
+			hasUser := false
+			for i := headEnd; i < len(msgs); i++ {
 				if msgs[i].Role == schema.User {
-					start = i
+					hasUser = true
 					break
 				}
 			}
+			if !hasUser {
+				return nil, fmt.Errorf("agent: 历史压缩失败：%d 条消息中找不到 user 边界", len(msgs))
+			}
+			start = len(msgs)
 		}
 	}
-	if (start < len(msgs) && msgs[start].Role != schema.User) || start == headEnd {
-		return nil, fmt.Errorf("agent: 历史压缩失败：%d 条消息中找不到 user 边界", len(msgs))
+	if start == len(msgs) {
+		out := make([]*schema.Message, 0, headEnd+1)
+		out = append(out, msgs[:headEnd]...)
+		out = append(out, schema.UserMessage(fmt.Sprintf(
+			"[系统提示] 早期 %d 条历史消息已因超出上下文限制被截断。", len(msgs)-headEnd)))
+		return out, nil
 	}
 
 	out := make([]*schema.Message, 0, headEnd+len(msgs)-start+1)
