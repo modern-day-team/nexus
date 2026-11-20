@@ -358,8 +358,8 @@ func TestRegressionTokenHeadSplitsToolPair(t *testing.T) {
 	ctx := context.Background()
 	c := NewTokenCompactor(100, 15)
 	msgs := []*schema.Message{
-		schema.UserMessage("头部说明甲乙丙丁"),                       // 8 tokens
-		schema.AssistantMessage("", []schema.ToolCall{        // 约 3 tokens
+		schema.UserMessage("头部说明甲乙丙丁"), // 8 tokens
+		schema.AssistantMessage("", []schema.ToolCall{ // 约 3 tokens
 			{Function: schema.FunctionCall{Name: "echo", Arguments: `{"text":"abcd"}`}},
 		}),
 		schema.ToolMessage("结果戊己庚", "id-0"), // 5 tokens

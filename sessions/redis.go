@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/cloudwego/eino/schema"
+	"github.com/redis/go-redis/v9"
 )
 
 // redisKeyPrefix 是 Redis 键的统一前缀，避免与其他业务键冲突。
