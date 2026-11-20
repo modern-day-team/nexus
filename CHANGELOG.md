@@ -1,5 +1,18 @@
 # 更新日志
 
+## v0.6.0
+- `llm.NewFallbackModel`：多模型顺序降级链，每个候选独立熔断器（closed→open→half-open，连续失败达阈值熔断、冷却后半开恢复）；`Current()`/`OpenCircuits()` 观测；`WithTools` 派生共享熔断状态；流建立后不切换模型。
+
+## v0.5.0
+- `agent.Options.TraceHook`：内核追踪钩子（轮次开始/结束、工具调用），纯标准库零依赖。
+- `otelx` 包：OpenTelemetry GenAI 语义约定映射（`gen_ai.*.agent.run` / `execute_tool` span、token 用量与错误状态），仅依赖 otel API。
+
+## v0.4.0
+- `sessions` 包：`RedisSession`（go-redis，TTL 可选）与 `SQLiteSession`（modernc.org/sqlite 纯 Go，WAL+busy_timeout）两种 `agent.Session` 参考实现，跨进程恢复会话；测试用 miniredis，无需真实外部服务。
+
+## v0.3.0
+- `agent.NewDelegationStreamTool`：委派工具的流式事件透传——子 Agent 的 token/思考/工具事件经父事件流透出，`Event.Agent` 标识来源；父 ctx 无 emitter 时退化为普通委派。
+
 ## v0.2.0
 
 ### 新增
