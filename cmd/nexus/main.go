@@ -147,6 +147,11 @@ func streamChat(ctx context.Context, a *agent.Agent, input string) error {
 			}
 		case agent.EventError:
 			return ev.Err
+		case agent.EventDone:
+			if ev.Err != nil {
+				return ev.Err
+			}
+			return nil
 		}
 	}
 }

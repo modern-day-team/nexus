@@ -95,10 +95,13 @@ for {
 	case agent.EventToolStart: // ev.ToolName、ev.Arguments
 	case agent.EventToolEnd:   // ev.Result、ev.Err
 	case agent.EventError:     // ev.Err
+		case agent.EventDone:      // 本轮结束：历史已落库，ev.Usage、ev.Err
 	}
 }
 events.Close()
 ```
+
+事件契约：`EventDone` 总是最后一个事件，到达时本轮历史已写入，可安全发起下一轮；出错时 `EventError` 先到、`EventDone.Err` 携带同一错误。同一个 `Agent` 实例上的轮次串行执行，流式调用必须消费完或 `Close`，否则后续轮次会被阻塞；`Reset` 会等待进行中的轮次结束后再清空。
 
 自定义工具可直接使用 Eino 的 `tool/utils.InferTool` 从结构体推断参数 schema，再传入 `agent.Options.Tools`。实现 `tool.InvokableTool` 的工具会被自动包装并上报 `tool_start` / `tool_end` 事件。
 

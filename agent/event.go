@@ -23,9 +23,19 @@ const (
 	EventToolStart EventType = "tool_start"
 	// EventToolEnd 表示一次工具调用结束。
 	EventToolEnd EventType = "tool_end"
-	// EventError 表示流式过程中出现错误，流随后结束。
+	// EventError 表示流式过程中出现错误。EventDone 会随后到达并携带同一错误。
 	EventError EventType = "error"
+	// EventDone 表示本轮结束，且会话历史已写入。它总是最后一个事件。
+	// 若本轮出错，Err 非空；Usage 在模型返回用量时非空。
+	EventDone EventType = "done"
 )
+
+// Usage 是本轮的 token 用量。
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+}
 
 // Event 是 ChatStreamEvents 输出的流式事件。
 type Event struct {
@@ -38,6 +48,8 @@ type Event struct {
 	Arguments string
 	// Result 为工具返回结果，仅 EventToolEnd 有效。
 	Result string
+	// Usage 为本轮 token 用量，仅 EventDone 可能非空。
+	Usage *Usage
 	// Err 为工具执行或流式过程中的错误。
 	Err error
 }
@@ -53,6 +65,19 @@ func withEmitter(ctx context.Context, emit eventEmitter) context.Context {
 func emitEvent(ctx context.Context, ev Event) {
 	if emit, ok := ctx.Value(emitterCtxKey{}).(eventEmitter); ok && emit != nil {
 		emit(ev)
+	}
+}
+
+// eventSink 在 runDone 关闭后丢弃事件，保证工具 goroutine 不会因通道关闭而 panic。
+type eventSink struct {
+	ch   chan<- Event
+	done <-chan struct{}
+}
+
+func (s eventSink) emit(ev Event) {
+	select {
+	case s.ch <- ev:
+	case <-s.done:
 	}
 }
 
@@ -100,84 +125,125 @@ func observeTools(tools []tool.BaseTool) []tool.BaseTool {
 }
 
 // ChatStreamEvents 发送一条用户消息并以事件流方式返回模型输出与工具调用过程。
-// 调用方必须在使用完后 Close 返回的流；历史会在流结束后写入。
+//
+// 事件契约：EventDone 是最后一个事件，到达时本轮会话历史已写入；
+// 若本轮出错，EventError 先于 EventDone 到达且两者 Err 相同。
+// 调用方必须消费完或 Close 返回的流，否则该轮次不会结束。
 func (a *Agent) ChatStreamEvents(
 	ctx context.Context, input string, opts ...einoagent.AgentOption,
 ) (*schema.StreamReader[Event], error) {
-	a.mu.Lock()
+	if err := a.beginTurn(ctx); err != nil {
+		return nil, err
+	}
+
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
-		a.mu.Unlock()
+		a.endTurn()
 		return nil, err
 	}
 
 	events := make(chan Event, 64)
-	ctx = withEmitter(ctx, func(ev Event) {
-		select {
-		case events <- ev:
-		case <-ctx.Done():
-		}
-	})
+	runDone := make(chan struct{})
+	sink := eventSink{ch: events, done: runDone}
+	runCtx := withEmitter(ctx, sink.emit)
 
-	modelStream, err := a.inner.Stream(ctx, msgs, opts...)
+	modelStream, err := a.inner.Stream(runCtx, msgs, opts...)
 	if err != nil {
-		a.mu.Unlock()
+		a.endTurn()
 		return nil, err
 	}
-	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
-		a.mu.Unlock()
+	if err := a.session.Append(runCtx, schema.UserMessage(input)); err != nil {
 		modelStream.Close()
+		a.endTurn()
 		return nil, err
 	}
-	a.mu.Unlock()
 
 	out, writer := schema.Pipe[Event](64)
 
 	// 单一写入者：把内部事件通道转发到 Eino 流，保证 Send 串行。
-	go func() {
-		var closed bool
-		for ev := range events {
-			if closed {
-				continue
-			}
-			closed = writer.Send(ev, nil)
-		}
-		writer.Close()
-	}()
+	go drainEvents(writer, events, runDone)
 
 	go func() {
+		defer a.endTurn()
 		defer modelStream.Close()
+		defer close(runDone)
 
 		var content, reasoning strings.Builder
+		var usage *Usage
+		var streamErr error
+
 		for {
 			chunk, recvErr := modelStream.Recv()
 			if errors.Is(recvErr, io.EOF) {
 				break
 			}
 			if recvErr != nil {
-				events <- Event{Type: EventError, Err: recvErr}
+				streamErr = recvErr
+				sink.emit(Event{Type: EventError, Err: recvErr})
 				break
 			}
 			if chunk == nil {
 				continue
 			}
+
+			if meta := chunk.ResponseMeta; meta != nil && meta.Usage != nil {
+				usage = &Usage{
+					PromptTokens:     meta.Usage.PromptTokens,
+					CompletionTokens: meta.Usage.CompletionTokens,
+					TotalTokens:      meta.Usage.TotalTokens,
+				}
+			}
 			if chunk.ReasoningContent != "" {
 				reasoning.WriteString(chunk.ReasoningContent)
-				events <- Event{Type: EventReasoning, Content: chunk.ReasoningContent}
+				sink.emit(Event{Type: EventReasoning, Content: chunk.ReasoningContent})
 			}
 			if chunk.Content != "" {
 				content.WriteString(chunk.Content)
-				events <- Event{Type: EventToken, Content: chunk.Content}
+				sink.emit(Event{Type: EventToken, Content: chunk.Content})
 			}
 		}
-		close(events)
 
-		_ = a.session.Append(ctx, &schema.Message{
+		// 先写入历史再发 Done，保证调用方收到 Done 后可安全发起下一轮。
+		appendErr := a.session.Append(context.WithoutCancel(ctx), &schema.Message{
 			Role:             schema.Assistant,
 			Content:          content.String(),
 			ReasoningContent: reasoning.String(),
 		})
+		if appendErr != nil && streamErr == nil {
+			streamErr = appendErr
+		}
+
+		sink.emit(Event{Type: EventDone, Usage: usage, Err: streamErr})
 	}()
 
 	return out, nil
+}
+
+// drainEvents 转发事件直到本轮结束，并丢弃消费方关闭后的事件。
+func drainEvents(writer *schema.StreamWriter[Event], events <-chan Event, runDone <-chan struct{}) {
+	defer writer.Close()
+
+	var closed bool
+	forward := func(ev Event) {
+		if closed {
+			return
+		}
+		closed = writer.Send(ev, nil)
+	}
+
+	for {
+		select {
+		case ev := <-events:
+			forward(ev)
+		case <-runDone:
+			for {
+				select {
+				case ev := <-events:
+					forward(ev)
+				default:
+					return
+				}
+			}
+		}
+	}
 }

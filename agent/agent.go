@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -39,13 +38,15 @@ type Options struct {
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
-// 同一实例内的会话消息由 Session 保存，Chat 会串行执行以保证多轮顺序。
+// 同一实例上的轮次（Chat/流式对话/Reset）串行执行；流式调用必须消费完或关闭返回的流，
+// 否则该轮次不会结束，后续轮次会被阻塞。
 type Agent struct {
 	inner        *react.Agent
 	systemPrompt string
 	session      Session
 
-	mu sync.Mutex
+	// turn 是容量为 1 的信号量，用于串行化轮次。
+	turn chan struct{}
 }
 
 // New 构建 Agent。
@@ -78,13 +79,16 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		inner:        inner,
 		systemPrompt: opts.SystemPrompt,
 		session:      session,
+		turn:         make(chan struct{}, 1),
 	}, nil
 }
 
 // Chat 发送一条用户消息并等待完整回复，同时把本轮对话写入会话。
 func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentOption) (*schema.Message, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	if err := a.beginTurn(ctx); err != nil {
+		return nil, err
+	}
+	defer a.endTurn()
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
@@ -103,37 +107,44 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 }
 
 // ChatStream 发送一条用户消息并以流式方式返回回复分片。
-// 调用方必须在使用完后 Close 返回的流。会话历史会在流被完整消费后异步写入。
-func (a *Agent) ChatStream(ctx context.Context, input string, opts ...einoagent.AgentOption) (*schema.StreamReader[*schema.Message], error) {
-	a.mu.Lock()
+// 调用方必须在使用完后 Close 返回的流；本轮历史在流结束后写入。
+func (a *Agent) ChatStream(
+	ctx context.Context, input string, opts ...einoagent.AgentOption,
+) (*schema.StreamReader[*schema.Message], error) {
+	if err := a.beginTurn(ctx); err != nil {
+		return nil, err
+	}
+
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
-		a.mu.Unlock()
+		a.endTurn()
 		return nil, err
 	}
 
 	stream, err := a.inner.Stream(ctx, msgs, opts...)
 	if err != nil {
-		a.mu.Unlock()
+		a.endTurn()
 		return nil, err
 	}
 	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
-		a.mu.Unlock()
 		stream.Close()
+		a.endTurn()
 		return nil, err
 	}
-	a.mu.Unlock()
 
 	copies := stream.Copy(2)
 	out, internal := copies[0], copies[1]
 
 	go func() {
+		defer a.endTurn()
 		defer internal.Close()
+
 		msg, err := schema.ConcatMessageStream(internal)
 		if err != nil {
 			return
 		}
-		_ = a.session.Append(ctx, finalAssistantMessage(msg))
+		// 历史写入不随请求 ctx 取消，避免调用方取消后历史永久缺失。
+		_ = a.session.Append(context.WithoutCancel(ctx), finalAssistantMessage(msg))
 	}()
 
 	return out, nil
@@ -144,9 +155,28 @@ func (a *Agent) History(ctx context.Context) ([]*schema.Message, error) {
 	return a.session.Messages(ctx)
 }
 
-// Reset 清空当前会话。
+// Reset 清空当前会话。若存在进行中的轮次，Reset 会等待其结束后再清空。
 func (a *Agent) Reset(ctx context.Context) error {
+	if err := a.beginTurn(ctx); err != nil {
+		return err
+	}
+	defer a.endTurn()
+
 	return a.session.Clear(ctx)
+}
+
+// beginTurn 获取本轮执行权，保证同一实例上的轮次串行。
+func (a *Agent) beginTurn(ctx context.Context) error {
+	select {
+	case a.turn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *Agent) endTurn() {
+	<-a.turn
 }
 
 // requestMessages 组合系统提示词、会话历史与本次用户输入。
