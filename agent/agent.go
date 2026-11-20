@@ -35,6 +35,13 @@ type Options struct {
 	MaxStep int
 	// Session 为会话存储，可为空，默认使用 MemorySession。
 	Session Session
+	// Compactor 在每次请求前压缩会话历史，可为空（不压缩）。
+	// 默认实现见 TruncateCompactor。
+	Compactor Compactor
+	// Retry 为模型调用重试策略，可为空（不重试）。
+	Retry *RetryOptions
+	// ToolApprover 在每次工具调用前被询问，可为空（全部放行）。
+	ToolApprover ToolApprover
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
@@ -44,6 +51,7 @@ type Agent struct {
 	inner        *react.Agent
 	systemPrompt string
 	session      Session
+	compactor    Compactor
 
 	// turn 是容量为 1 的信号量，用于串行化轮次。
 	turn chan struct{}
@@ -60,9 +68,10 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	}
 
 	inner, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: opts.ChatModel,
+		// 审批钩子在内层（先问询），事件观测在外层（放行后才发工具事件）。
+		ToolCallingModel: newRetryingModel(opts.ChatModel, opts.Retry),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: observeTools(opts.Tools),
+			Tools: observeTools(applyApproval(opts.Tools, opts.ToolApprover)),
 		},
 		MaxStep: maxStep,
 	})
@@ -79,6 +88,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		inner:        inner,
 		systemPrompt: opts.SystemPrompt,
 		session:      session,
+		compactor:    opts.Compactor,
 		turn:         make(chan struct{}, 1),
 	}, nil
 }
@@ -189,6 +199,12 @@ func (a *Agent) requestMessages(ctx context.Context, input string) ([]*schema.Me
 	history, err := a.session.Messages(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// 请求时压缩，不回写会话：历史本身保持完整，压缩只影响本次请求。
+	if a.compactor != nil {
+		if history, err = a.compactor.Compact(ctx, history); err != nil {
+			return nil, err
+		}
 	}
 
 	msgs := make([]*schema.Message, 0, len(history)+2)

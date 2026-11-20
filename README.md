@@ -95,6 +95,14 @@ func main() {
 - **上下文缓存**：DeepSeek 的硬盘级上下文缓存按请求前缀自动命中。内核保证多轮间消息前缀字节级稳定（系统提示词 → 只追加的历史），无需额外配置即可命中；不要在内核外改写历史消息。
 - **命中率监控**：`ChatStreamEvents` 的 `EventDone.Usage.CachedTokens` 透出本轮命中缓存的 prompt token 数，`CachedTokens / PromptTokens` 即缓存命中率。
 
+## 内核增强选项（借鉴 Codex / Claude Code）
+
+以下均为 `agent.Options` 可选项，默认关闭：
+
+- **历史压缩**（对应 Claude Code auto-compact）：`Compactor` 在每次请求前压缩历史，不回写会话。默认实现 `agent.NewTruncateCompactor(maxMessages, keepHead)`：保留开头固定上下文与最近消息，截断点对齐 user 边界以免切开工具调用对，并插入截断说明。
+- **模型重试**（对应 Codex 的 transient error retry）：`Retry: &agent.RetryOptions{MaxAttempts: 3, BaseDelay: 500ms, MaxDelay: 10s}`。指数退避 + 抖动，只重试未产出任何分片的失败，流建立后中断不重试。
+- **工具审批**（对应 Claude Code permission mode）：`ToolApprover` 在每次工具调用前被询问；返回错误即拒绝，拒绝原因作为工具结果反馈给模型（本轮不中断），模型可据此调整后续动作。
+
 ## 事件契约
 
 - `EventDone` 总是最后一个事件，到达时本轮历史已写入，可安全发起下一轮。
