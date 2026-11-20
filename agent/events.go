@@ -58,6 +58,9 @@ type Event struct {
 	Usage *Usage
 	// Err 为工具执行或流式过程中的错误。
 	Err error
+	// Agent 是产生该事件的 Agent 名。空串表示本体 Agent；
+	// 子 Agent 经委派透传的事件会带上委派工具名。
+	Agent string
 }
 
 type eventEmitter func(Event)

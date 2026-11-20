@@ -32,16 +32,25 @@ type delegationInput struct {
 // 工具入参 schema 为 {"input": string}（required），即要传给子 Agent 的任务描述。
 // 子 Agent 的会话历史跨多次委派保留（子 Agent 有记忆）。
 func NewDelegationTool(opts DelegationOptions) (tool.InvokableTool, error) {
-	if opts.Name == "" {
-		return nil, errors.New("agent: 委派工具 Name 不能为空")
-	}
-	if opts.Description == "" {
-		return nil, errors.New("agent: 委派工具 Description 不能为空")
-	}
-	if opts.SubAgent == nil {
-		return nil, errors.New("agent: 委派工具 SubAgent 不能为空")
+	if err := validateDelegationOptions(opts); err != nil {
+		return nil, err
 	}
 	return toolutils.InferTool(opts.Name, opts.Description, runDelegation(opts.SubAgent))
+}
+
+// validateDelegationOptions 校验委派工具的构建参数，NewDelegationTool 与
+// NewDelegationStreamTool 共用。
+func validateDelegationOptions(opts DelegationOptions) error {
+	if opts.Name == "" {
+		return errors.New("agent: 委派工具 Name 不能为空")
+	}
+	if opts.Description == "" {
+		return errors.New("agent: 委派工具 Description 不能为空")
+	}
+	if opts.SubAgent == nil {
+		return errors.New("agent: 委派工具 SubAgent 不能为空")
+	}
+	return nil
 }
 
 // runDelegation 返回委派工具的执行函数。
