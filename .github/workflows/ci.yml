@@ -1,0 +1,37 @@
+# CI 工作流：推送与 Pull Request 时执行格式检查、静态检查与测试
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - '**'
+  pull_request:
+
+jobs:
+  ci:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go（版本取自 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt 格式检查
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未通过 gofmt 格式检查："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet 静态检查
+        run: go vet ./...
+
+      - name: go test（含竞态检测）
+        run: go test ./... -race -count=1

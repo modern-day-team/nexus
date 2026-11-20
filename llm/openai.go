@@ -6,8 +6,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/cloudwego/eino/components/model"
 	openai "github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino/components/model"
 )
 
 // Config 描述一个 OpenAI 兼容的 ChatModel 连接参数。

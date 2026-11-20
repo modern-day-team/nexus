@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/cloudwego/eino/components/model"
 	openai "github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino/components/model"
 )
 
 // DeepSeek 默认连接参数。
