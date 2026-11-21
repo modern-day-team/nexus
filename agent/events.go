@@ -97,26 +97,38 @@ type eventSink struct {
 	writer *schema.StreamWriter[Event]
 	done   <-chan struct{}
 	drops  atomic.Int64
+	// dropped 指向 Agent 级累计计数（构造时传入 &a.droppedEvents），
+	// 使 DroppedEvents 能跨轮次汇总。可为 nil（独立构造的 sink）。
+	dropped *atomic.Int64
 }
 
 func (s *eventSink) emit(ev Event) {
-	select {
-	case <-s.done:
-		s.drops.Add(1)
+	if s.markDrop() {
 		return
-	default:
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 双检：等待锁期间本轮可能已结束。Send 在 writer 关闭后返回 closed=true，
 	// 不会 panic，视为丢弃。
+	if s.markDrop() {
+		return
+	}
+	s.writer.Send(ev, nil)
+}
+
+// markDrop 在本轮已结束时累计丢弃计数（sink 局部 + Agent 级汇总），返回
+// true 表示事件已丢弃。
+func (s *eventSink) markDrop() bool {
 	select {
 	case <-s.done:
 		s.drops.Add(1)
-		return
+		if s.dropped != nil {
+			s.dropped.Add(1)
+		}
+		return true
 	default:
+		return false
 	}
-	s.writer.Send(ev, nil)
 }
 
 // ChatStreamEvents 发送一条用户消息并以事件流方式返回模型输出与工具调用过程。
@@ -152,7 +164,7 @@ func (a *Agent) ChatStreamEvents(
 
 	runDone := make(chan struct{})
 	out, writer := schema.Pipe[Event](64)
-	sink := eventSink{writer: writer, done: runDone}
+	sink := eventSink{writer: writer, done: runDone, dropped: &a.droppedEvents}
 	runCtx := withEmitter(withTrace(ctx, a.traceHook), sink.emit)
 
 	// 失败收尾：发 EventError 与 EventDone，保持"Done 总是最后一个事件"的契约。
