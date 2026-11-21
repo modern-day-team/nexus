@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.12.0
+- 性能专项：事件流单跳转发（eventSink 直接持锁 Send，去掉内部 channel 与转发 goroutine，附吞吐回归基准）；TokenCompactor token 计算缓存（长会话每轮压缩 -82~-87% CPU）；系统提示词消息复用；EstimateTokens 单遍化；FileSession 深拷贝成本的量化结论（副本语义的必要代价，不做缓存）。
+
+## v0.11.0
+- `Options.ToolTimeout`：单次工具调用超时，超时与 panic 均转为错误文本反馈给模型（robustTool 层，不中断本轮）；工具包装层级为 观测 → 审批 → 超时/恢复。
+- `(*Agent).DroppedEvents() int64`：事件流丢弃计数导出（慢消费者可观测）。
+- `agent.ExportSession` / `ImportSession`：会话 JSONL 快照导出/导入（与 FileSession 格式一致），供调试回放与迁移。
+
+## v0.10.0
+- `agent.SessionStore` 接口 + `MemoryStore`：按 conversationID 管理会话集合（同 id 同实例、跨会话隔离）。
+- `sessions.NewRedisStore` / `NewSQLiteStore`：Redis 原生 TTL；SQLite 单表 + conversation_id 索引 + last_active 后台闲置清理（`WithCleanupInterval`）。
+- `agent.NewWithStore`：从 store 取会话注入 Options 的便捷构造。
+
+## v0.9.0
+- trace span 父子嵌套：`Options.ContextCustomizer` 使 TurnStart 创建的 run span 注入整轮执行 ctx，`execute_tool` span 成为 run span 的子 span（otelx.New 返回 Hooks 双注册，旧 NewTraceHook 兼容）。
+- 属性补齐：`gen_ai.request.model`（`Options.ModelName`）与 `gen_ai.usage.cached_tokens`。
+
+## v0.8.0
+- `agent.NewInteractiveApprover`：HITL 交互式审批——工具调用经事件流发出 `EventApprovalRequest`（`Event.Request`/`Event.Respond`），外部决策后放行或拒绝；超时/ctx 取消按拒绝处理；无 emitter 路径直接拒绝；嵌套委派透传可用。
+- **行为变更**：`ChatStreamEvents` 现在立即返回事件流，模型调用与工具执行在后台 goroutine 驱动（此前 eino ReAct Stream 同步跑完首轮才返回，事件滞后送达）；inner.Stream 阶段错误改经 EventError/EventDone 送达。
+
 ## v0.7.0
 - `agent.GenerateInto`：结构化输出——要求模型返回 JSON 并解析到任意 Go 类型，解析失败自动把错误反馈给模型重试（最多 3 轮，中间轮不落库），成功后与 Chat 同样的历史/UsageHook/Trace 语义。
 - `agent.ExtractJSON` / `agent.ErrNoJSON`：从模型输出中剥离 markdown 围栏与杂文本、提取 JSON 子串的导出工具。
