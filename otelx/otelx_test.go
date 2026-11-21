@@ -247,3 +247,157 @@ func (m *errModel) Stream(context.Context, []*schema.Message, ...model.Option) (
 func (m *errModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	return m, nil
 }
+
+// newRecorderAgentWithCustomizer 构建带 New 双注册钩子（span 父子嵌套）的 Agent。
+func newRecorderAgentWithCustomizer(t *testing.T, cm model.ToolCallingChatModel, tools ...tool.BaseTool) (*agent.Agent, *tracetest.SpanRecorder) {
+	t.Helper()
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	hooks := New(context.Background(), tp.Tracer("nexus-test"))
+
+	a, err := agent.New(context.Background(), agent.Options{
+		ChatModel:         cm,
+		Tools:             tools,
+		TraceHook:         hooks.TraceHook,
+		ContextCustomizer: hooks.ContextCustomizer,
+	})
+	if err != nil {
+		t.Fatalf("构建 Agent 失败: %v", err)
+	}
+	return a, rec
+}
+
+func attrsOf(s sdktrace.ReadOnlySpan) map[string]interface{} {
+	attrs := map[string]interface{}{}
+	for _, kv := range s.Attributes() {
+		attrs[string(kv.Key)] = kv.Value.AsInterface()
+	}
+	return attrs
+}
+
+func scriptedEchoFixture(t *testing.T) (*schema.Message, *schema.Message, *schema.Message) {
+	t.Helper()
+	final := &schema.Message{
+		Role:    schema.Assistant,
+		Content: "final",
+		ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+			PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12,
+			PromptTokenDetails: schema.PromptTokenDetails{CachedTokens: 4},
+		}},
+	}
+	toolCall := &schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID:       "call_1",
+			Type:     "function",
+			Function: schema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
+		}},
+	}
+	return toolCall, final, final
+}
+
+func TestNestingToolSpanIsChildOfRunSpan(t *testing.T) {
+	toolCall, final, _ := scriptedEchoFixture(t)
+	a, rec := newRecorderAgentWithCustomizer(t,
+		&scriptedModel{streams: [][]*schema.Message{{toolCall}, {final}}},
+		newEchoTool(t),
+	)
+
+	if _, err := a.Chat(context.Background(), "use echo"); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+
+	runSpan := spanByName(rec, "gen_ai.agent.agent.run")
+	if runSpan == nil {
+		t.Fatalf("缺少 agent.run span, got %d spans", len(rec.Ended()))
+	}
+	toolSpan := spanByName(rec, "execute_tool echo")
+	if toolSpan == nil {
+		t.Fatalf("缺少 execute_tool span, got %d spans", len(rec.Ended()))
+	}
+	if toolSpan.Parent().SpanID() != runSpan.SpanContext().SpanID() {
+		t.Fatalf("tool span parent = %v, want run span %v",
+			toolSpan.Parent().SpanID(), runSpan.SpanContext().SpanID())
+	}
+
+	// gen_ai.request.model 与 cached_tokens 属性（本次通过 ModelName 配置）。
+	ra := attrsOf(runSpan)
+	if ra["gen_ai.usage.cached_tokens"] != int64(4) {
+		t.Fatalf("cached_tokens = %v, want 4", ra["gen_ai.usage.cached_tokens"])
+	}
+}
+
+func TestModelAttributeOnRunSpan(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	hooks := New(context.Background(), tp.Tracer("nexus-test"))
+
+	a, err := agent.New(context.Background(), agent.Options{
+		ChatModel:         &staticModel{reply: &schema.Message{Role: schema.Assistant, Content: "hi"}},
+		TraceHook:         hooks.TraceHook,
+		ContextCustomizer: hooks.ContextCustomizer,
+		ModelName:         "glm-5",
+	})
+	if err != nil {
+		t.Fatalf("构建 Agent 失败: %v", err)
+	}
+	if _, err := a.Chat(context.Background(), "hi"); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	attrs := attrsOf(spanByName(rec, "gen_ai.agent.agent.run"))
+	if attrs["gen_ai.request.model"] != "glm-5" {
+		t.Fatalf("gen_ai.request.model = %v, want glm-5", attrs["gen_ai.request.model"])
+	}
+}
+
+func TestLegacyHookKeepsIndependentToolSpan(t *testing.T) {
+	toolCall, final, _ := scriptedEchoFixture(t)
+	// 旧 NewTraceHook：无 customizer，工具 span 与 run span 独立。
+	a, rec := newRecorderAgent(t,
+		&scriptedModel{streams: [][]*schema.Message{{toolCall}, {final}}},
+		newEchoTool(t),
+	)
+	if _, err := a.Chat(context.Background(), "use echo"); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	runSpan := spanByName(rec, "gen_ai.agent.agent.run")
+	toolSpan := spanByName(rec, "execute_tool echo")
+	if runSpan == nil || toolSpan == nil {
+		t.Fatalf("缺少 span, got %d spans", len(rec.Ended()))
+	}
+	if toolSpan.Parent().SpanID().IsValid() {
+		t.Fatalf("旧 hook 下工具 span 不应有父 span, got %v", toolSpan.Parent().SpanID())
+	}
+}
+
+func TestNestingAcrossChatStreamEvents(t *testing.T) {
+	toolCall, final, _ := scriptedEchoFixture(t)
+	a, rec := newRecorderAgentWithCustomizer(t,
+		&scriptedModel{streams: [][]*schema.Message{{toolCall}, {final}}},
+		newEchoTool(t),
+	)
+
+	stream, err := a.ChatStreamEvents(context.Background(), "use echo")
+	if err != nil {
+		t.Fatalf("ChatStreamEvents 失败: %v", err)
+	}
+	for {
+		ev, rerr := stream.Recv()
+		if rerr != nil {
+			break
+		}
+		if ev.Type == agent.EventDone {
+			break
+		}
+	}
+
+	runSpan := spanByName(rec, "gen_ai.agent.agent.run")
+	toolSpan := spanByName(rec, "execute_tool echo")
+	if runSpan == nil || toolSpan == nil {
+		t.Fatalf("缺少 span, got %d spans", len(rec.Ended()))
+	}
+	if toolSpan.Parent().SpanID() != runSpan.SpanContext().SpanID() {
+		t.Fatalf("ChatStreamEvents 下 tool span parent = %v, want %v",
+			toolSpan.Parent().SpanID(), runSpan.SpanContext().SpanID())
+	}
+}

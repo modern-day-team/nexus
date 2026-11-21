@@ -61,6 +61,16 @@ type Options struct {
 	// TraceHook 在每轮开始/结束与每次工具调用结束时被回调，可为空（不回调）。
 	// 见 TraceHook。
 	TraceHook TraceHook
+	// ModelName 是本轮使用的模型名，会随 TurnStart/TurnEnd trace 事件
+	// （TraceEvent.Model）透出，供下游映射为 gen_ai.request.model 等属性。
+	// 可为空。
+	ModelName string
+	// ContextCustomizer 在每轮 TraceTurnStart 发出后被调用（可为空，零开销跳过），
+	// 返回的 ctx 作为本轮后续所有操作的执行 ctx，会贯穿整轮，包括工具执行。
+	// 实现不得阻塞；典型用途是把 TurnStart 创建的 trace span 注入请求 ctx，
+	// 使工具 span 挂到 run span 之下（见 otelx.New）。
+	// 见 ContextCustomizer。
+	ContextCustomizer ContextCustomizer
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
@@ -77,6 +87,8 @@ type Agent struct {
 	compactor     Compactor
 	usageHook     UsageHook
 	traceHook     TraceHook
+	modelName     string
+	ctxCustomizer ContextCustomizer
 
 	// turn 串行化轮次。
 	turn turnGate
@@ -109,13 +121,15 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	}
 
 	a := &Agent{
-		inner:        inner,
-		systemPrompt: opts.SystemPrompt,
-		session:      session,
-		compactor:    opts.Compactor,
-		usageHook:    opts.UsageHook,
-		traceHook:    opts.TraceHook,
-		turn:         newTurnGate(),
+		inner:         inner,
+		systemPrompt:  opts.SystemPrompt,
+		session:       session,
+		compactor:     opts.Compactor,
+		usageHook:     opts.UsageHook,
+		traceHook:     opts.TraceHook,
+		modelName:     opts.ModelName,
+		ctxCustomizer: opts.ContextCustomizer,
+		turn:          newTurnGate(),
 	}
 	if opts.SystemPrompt != "" {
 		// 系统提示词在构建期固定，消息不可变，跨轮次复用同一指针安全。
@@ -146,17 +160,18 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 	defer a.turn.end()
 
 	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	// TurnStart 先发、customizer 后调用，customizer 返回的 ctx 贯穿整轮（含工具执行）。
 	ctx = withTrace(ctx, a.traceHook)
-	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
+	ctx = a.startTurnTrace(ctx, input)
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 
 	reply, err := a.inner.Generate(ctx, msgs, opts...)
 	if err != nil {
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 
@@ -165,7 +180,7 @@ func (a *Agent) Chat(ctx context.Context, input string, opts ...einoagent.AgentO
 	}
 	usage := usageFromMeta(reply.ResponseMeta)
 	a.notifyUsage(ctx, usage)
-	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage})
+	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage, Model: a.modelName})
 	return reply, nil
 }
 
@@ -179,26 +194,27 @@ func (a *Agent) ChatStream(
 	}
 
 	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	// TurnStart 先发、customizer 后调用，customizer 返回的 ctx 贯穿整轮（含工具执行）。
 	ctx = withTrace(ctx, a.traceHook)
-	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
+	ctx = a.startTurnTrace(ctx, input)
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
 		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 
 	stream, err := a.inner.Stream(ctx, msgs, opts...)
 	if err != nil {
 		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 	if err := a.session.Append(ctx, schema.UserMessage(input)); err != nil {
 		stream.Close()
 		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 
@@ -211,14 +227,14 @@ func (a *Agent) ChatStream(
 
 		msg, err := schema.ConcatMessageStream(internal)
 		if err != nil {
-			a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+			a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 			return
 		}
 		// 历史写入不随请求 ctx 取消，避免调用方取消后历史永久缺失。
 		_ = a.session.Append(context.WithoutCancel(ctx), finalAssistantMessage(msg))
 		usage := usageFromMeta(msg.ResponseMeta)
 		a.notifyUsage(ctx, usage)
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage, Model: a.modelName})
 	}()
 
 	return out, nil

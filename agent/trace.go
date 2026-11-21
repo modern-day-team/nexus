@@ -33,7 +33,22 @@ type TraceEvent struct {
 	Usage *Usage
 	// Err 为本轮或工具的错误。
 	Err error
+	// Model 为本轮使用的模型名，取自 Options.ModelName，仅轮次事件
+	// （TraceTurnStart/TraceTurnEnd）携带，未配置时为空串。
+	Model string
 }
+
+// ContextCustomizer 在每轮 TraceTurnStart 事件发出后被调用，返回的 ctx
+// 作为本轮后续所有操作的执行 ctx（包括 inner.Generate/Stream 与工具执行）。
+//
+// 约定：
+//   - 实现不得阻塞（同步调用，在轮次关键路径上）；
+//   - 返回的 ctx 会贯穿整轮，包括工具执行，因此可用来注入
+//     OTel span 等 per-turn 资源（见 otelx.New 的 Hooks.ContextCustomizer）；
+//   - 收到的 ctx 是请求 ctx（尚未被本轮 customizer 修改过），
+//     ev 是刚发出的 TraceTurnStart 事件；
+//   - 为 nil 时零开销跳过。
+type ContextCustomizer func(ctx context.Context, ev TraceEvent) context.Context
 
 // TraceHook 在每轮开始/结束与每次工具调用结束时同步调用，实现应轻量。
 // hook 为 nil 时零开销跳过。
@@ -65,4 +80,18 @@ func (a *Agent) notifyTrace(ctx context.Context, ev TraceEvent) {
 		return
 	}
 	a.traceHook(ctx, ev)
+}
+
+// startTurnTrace 统一三条路径（Chat/ChatStream/ChatStreamEvents）的轮次起点：
+// 先用当前请求 ctx 发出 TraceTurnStart（事件本身不依赖 ctx 注入，先发可以
+// 让 otelx 等 hook 先启动 run span 并登记，随后的 customizer 才能取到它），
+// 再调用 ContextCustomizer（TurnStart 先发、customizer 后调用），返回的 ctx
+// 作为本轮后续所有操作（inner.Generate/Stream、工具执行）的执行 ctx。
+func (a *Agent) startTurnTrace(ctx context.Context, input string) context.Context {
+	ev := TraceEvent{Kind: TraceTurnStart, Input: input, Model: a.modelName}
+	a.notifyTrace(ctx, ev)
+	if a.ctxCustomizer != nil {
+		ctx = a.ctxCustomizer(ctx, ev)
+	}
+	return ctx
 }

@@ -137,13 +137,16 @@ func (a *Agent) ChatStreamEvents(
 	}
 
 	// 工具事件经 ctx 传递 hook；轮次事件经 Agent 字段直接回调。
+	// TurnStart 先发、customizer 后调用：TurnStart 事件本身不依赖 ctx 注入，
+	// 先发可让 otelx 等 hook 先启动 run span 并登记；customizer 返回的 ctx
+	// 在构造 runCtx 之前生效（withEmitter 外层），贯穿整轮含工具执行。
 	ctx = withTrace(ctx, a.traceHook)
-	a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnStart, Input: input})
+	ctx = a.startTurnTrace(ctx, input)
 
 	msgs, err := a.requestMessages(ctx, input)
 	if err != nil {
 		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		return nil, err
 	}
 
@@ -155,7 +158,7 @@ func (a *Agent) ChatStreamEvents(
 	// 失败收尾：发 EventError 与 EventDone，保持"Done 总是最后一个事件"的契约。
 	fail := func(err error) {
 		sink.emit(Event{Type: EventError, Err: err})
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err, Model: a.modelName})
 		sink.emit(Event{Type: EventDone, Err: err})
 	}
 
@@ -224,7 +227,7 @@ func (a *Agent) ChatStreamEvents(
 
 		// 在发 Done 之前回调用量钩子，保证钩子先于调用方收到本轮结束信号。
 		a.notifyUsage(ctx, usage)
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage, Err: streamErr})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Usage: usage, Err: streamErr, Model: a.modelName})
 
 		sink.emit(Event{Type: EventDone, Usage: usage, Err: streamErr})
 	}()
