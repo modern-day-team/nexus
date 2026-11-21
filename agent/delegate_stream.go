@@ -66,6 +66,8 @@ func runDelegationStream(sub *Agent, name string) func(context.Context, delegati
 				Usage:     ev.Usage,
 				Err:       ev.Err,
 				Agent:     name,
+				Request:   ev.Request,
+				Respond:   ev.Respond,
 			})
 
 			switch ev.Type {
