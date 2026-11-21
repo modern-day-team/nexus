@@ -25,6 +25,10 @@ const (
 	EventToolStart EventType = "tool_start"
 	// EventToolEnd 表示一次工具调用结束。
 	EventToolEnd EventType = "tool_end"
+	// EventApprovalRequest 表示一次待审批的工具调用，需要外部通过
+	// Respond 提交决定后本轮才会继续。仅在使用交互式审批（见
+	// interactive.go）时产生。
+	EventApprovalRequest EventType = "approval_request"
 	// EventError 表示流式过程中出现错误。EventDone 会随后到达并携带同一错误。
 	EventError EventType = "error"
 	// EventDone 表示本轮结束，且会话历史已写入。它总是最后一个事件。
@@ -61,6 +65,11 @@ type Event struct {
 	// Agent 是产生该事件的 Agent 名。空串表示本体 Agent；
 	// 子 Agent 经委派透传的事件会带上委派工具名。
 	Agent string
+	// Request 为审批请求，仅 EventApprovalRequest 有效。
+	Request *ApprovalRequest
+	// Respond 提交审批决定，仅 EventApprovalRequest 有效；只能调用一次，
+	// 二次调用为 no-op。必须在审批超时前调用。
+	Respond func(ApprovalDecision)
 }
 
 type eventEmitter func(Event)
@@ -95,6 +104,11 @@ func (s eventSink) emit(ev Event) {
 // 事件契约：EventDone 是最后一个事件，到达时本轮会话历史已写入；
 // 若本轮出错，EventError 先于 EventDone 到达且两者 Err 相同。
 // 调用方必须消费完或 Close 返回的流，否则该轮次不会结束。
+//
+// 函数立即返回事件流；模型调用与工具执行在后台 goroutine 中驱动。
+// 这保证工具执行期间产生的事件（如审批请求，见 interactive.go）能被
+// 调用方实时消费并响应，而不是等到本轮结束才批量送达。
+// inner.Stream 阶段的错误也经 EventError/EventDone 送达，而非同步返回。
 func (a *Agent) ChatStreamEvents(
 	ctx context.Context, input string, opts ...einoagent.AgentOption,
 ) (*schema.StreamReader[Event], error) {
@@ -118,28 +132,36 @@ func (a *Agent) ChatStreamEvents(
 	sink := eventSink{ch: events, done: runDone}
 	runCtx := withEmitter(withTrace(ctx, a.traceHook), sink.emit)
 
-	modelStream, err := a.inner.Stream(runCtx, msgs, opts...)
-	if err != nil {
-		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
-		return nil, err
-	}
-	if err := a.session.Append(runCtx, schema.UserMessage(input)); err != nil {
-		modelStream.Close()
-		a.turn.end()
-		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
-		return nil, err
-	}
-
 	out, writer := schema.Pipe[Event](64)
 
 	// 单一写入者：把内部事件通道转发到 Eino 流，保证 Send 串行。
 	go drainEvents(writer, events, runDone)
 
+	// 失败收尾：发 EventError 与 EventDone，保持"Done 总是最后一个事件"的契约。
+	fail := func(err error) {
+		sink.emit(Event{Type: EventError, Err: err})
+		a.notifyTrace(ctx, TraceEvent{Kind: TraceTurnEnd, Err: err})
+		sink.emit(Event{Type: EventDone, Err: err})
+	}
+
 	go func() {
 		defer a.turn.end()
-		defer modelStream.Close()
 		defer close(runDone)
+
+		// inner.Stream 在后台调用：eino ReAct 的 Stream 会同步跑完
+		// 首轮模型推理与工具调用才返回首个分片，若在此同步等待，
+		// 工具执行期间的事件（如审批请求）无法被调用方实时消费。
+		modelStream, err := a.inner.Stream(runCtx, msgs, opts...)
+		if err != nil {
+			fail(err)
+			return
+		}
+		defer modelStream.Close()
+
+		if err := a.session.Append(runCtx, schema.UserMessage(input)); err != nil {
+			fail(err)
+			return
+		}
 
 		var content, reasoning strings.Builder
 		var usage *Usage
