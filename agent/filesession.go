@@ -64,6 +64,15 @@ func (s *FileSession) Messages(context.Context) ([]*schema.Message, error) {
 }
 
 // cloneMessage 深拷贝消息，避免调用方修改影响会话缓存。
+//
+// 性能说明：曾考虑用 "上一次 Messages 输出" 的快照缓存 + generation
+// 计数省掉重复深拷贝，但因调用方可能修改返回副本、而元素指针无法
+// 无污染地复用（复用会被外部修改污染缓存与内部状态），深拷贝是语义
+// 正确性的必要代价，故不做缓存。实测成本约为每条消息 1 次切片分配
+// + O(len) 拷贝（1000 条历史 ≈ 170µs/次、1001 allocs/op，
+// 见 BenchmarkFileSessionMessagesLarge），随历史长度线性增长。
+// cloneMessage 本身已是最小实现：只浅拷贝结构体并按需拷贝
+// ToolCalls/MultiContent 切片，纯文本消息零分配。
 func cloneMessage(msg *schema.Message) *schema.Message {
 	if msg == nil {
 		return nil

@@ -69,10 +69,14 @@ type Options struct {
 type Agent struct {
 	inner        *react.Agent
 	systemPrompt string
-	session      Session
-	compactor    Compactor
-	usageHook    UsageHook
-	traceHook    TraceHook
+	// systemMessage 是构建时一次性创建的系统提示词消息（systemPrompt 非空时）。
+	// 消息内容不可变，requestMessages 每轮复用同一指针，
+	// 避免重复分配；调用方不应修改该消息。
+	systemMessage *schema.Message
+	session       Session
+	compactor     Compactor
+	usageHook     UsageHook
+	traceHook     TraceHook
 
 	// turn 串行化轮次。
 	turn turnGate
@@ -104,7 +108,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		session = NewMemorySession()
 	}
 
-	return &Agent{
+	a := &Agent{
 		inner:        inner,
 		systemPrompt: opts.SystemPrompt,
 		session:      session,
@@ -112,7 +116,12 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		usageHook:    opts.UsageHook,
 		traceHook:    opts.TraceHook,
 		turn:         newTurnGate(),
-	}, nil
+	}
+	if opts.SystemPrompt != "" {
+		// 系统提示词在构建期固定，消息不可变，跨轮次复用同一指针安全。
+		a.systemMessage = schema.SystemMessage(opts.SystemPrompt)
+	}
+	return a, nil
 }
 
 // NewWithStore 在 Options 基础上从 store 取 conversationID 对应的 Session 注入。
@@ -249,8 +258,8 @@ func (a *Agent) requestMessages(ctx context.Context, input string) ([]*schema.Me
 	}
 
 	msgs := make([]*schema.Message, 0, len(history)+2)
-	if a.systemPrompt != "" {
-		msgs = append(msgs, schema.SystemMessage(a.systemPrompt))
+	if a.systemMessage != nil {
+		msgs = append(msgs, a.systemMessage)
 	}
 	msgs = append(msgs, history...)
 	msgs = append(msgs, schema.UserMessage(input))
