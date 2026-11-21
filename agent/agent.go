@@ -24,6 +24,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -61,6 +63,10 @@ type Options struct {
 	// TraceHook 在每轮开始/结束与每次工具调用结束时被回调，可为空（不回调）。
 	// 见 TraceHook。
 	TraceHook TraceHook
+	// ToolTimeout 为单次工具调用的超时时长，<=0 表示不限时。
+	// 超时时工具结果为一条错误文本反馈给模型，不会中断本轮；
+	// panic 同样被恢复为错误结果（见 observe.go robustTool）。
+	ToolTimeout time.Duration
 }
 
 // Agent 是一个基于 ReAct 的 Agent 内核。
@@ -80,6 +86,10 @@ type Agent struct {
 
 	// turn 串行化轮次。
 	turn turnGate
+
+	// droppedEvents 累计所有轮次因消费方关闭/本轮结束而丢弃的事件总数。
+	// 每轮新建的 eventSink 通过指针累加到该字段（见 events.go）。
+	droppedEvents atomic.Int64
 }
 
 // New 构建 Agent。
@@ -95,7 +105,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 	inner, err := react.NewAgent(ctx, &react.AgentConfig{
 		ToolCallingModel: newRetryingModel(opts.ChatModel, opts.Retry),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: setupTools(opts.Tools, opts.ToolApprover),
+			Tools: setupTools(opts.Tools, opts.ToolApprover, opts.ToolTimeout),
 		},
 		MaxStep: maxStep,
 	})
@@ -227,6 +237,13 @@ func (a *Agent) ChatStream(
 // History 返回当前会话的历史消息副本（不含系统提示词）。
 func (a *Agent) History(ctx context.Context) ([]*schema.Message, error) {
 	return a.session.Messages(ctx)
+}
+
+// DroppedEvents 返回自 Agent 创建以来因消费方关闭/本轮结束而丢弃的
+// 流式事件总数。调用方提前 Close ChatStreamEvents 返回的流后，本轮
+// 后续事件会被丢弃并计入该值（见 events.go eventSink）。
+func (a *Agent) DroppedEvents() int64 {
+	return a.droppedEvents.Load()
 }
 
 // Reset 清空当前会话。若存在进行中的轮次，Reset 会等待其结束后再清空。
