@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	einoagent "github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/schema"
@@ -86,17 +88,35 @@ func emitEvent(ctx context.Context, ev Event) {
 	}
 }
 
-// eventSink 在 runDone 关闭后丢弃事件，保证工具 goroutine 不会因通道关闭而 panic。
+// eventSink 把事件单跳写入 Pipe writer：工具 goroutine 与模型循环等多个
+// 生产者经互斥串行 Send（Pipe 只允许单一写入者），相比"内部 channel +
+// 转发 goroutine"的两跳方案省去每事件一次的 goroutine 调度与 channel 往返。
+// 本轮结束（done 关闭）后到达的事件直接丢弃并计数。
 type eventSink struct {
-	ch   chan<- Event
-	done <-chan struct{}
+	mu     sync.Mutex
+	writer *schema.StreamWriter[Event]
+	done   <-chan struct{}
+	drops  atomic.Int64
 }
 
-func (s eventSink) emit(ev Event) {
+func (s *eventSink) emit(ev Event) {
 	select {
-	case s.ch <- ev:
 	case <-s.done:
+		s.drops.Add(1)
+		return
+	default:
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 双检：等待锁期间本轮可能已结束。Send 在 writer 关闭后返回 closed=true，
+	// 不会 panic，视为丢弃。
+	select {
+	case <-s.done:
+		s.drops.Add(1)
+		return
+	default:
+	}
+	s.writer.Send(ev, nil)
 }
 
 // ChatStreamEvents 发送一条用户消息并以事件流方式返回模型输出与工具调用过程。
@@ -127,15 +147,10 @@ func (a *Agent) ChatStreamEvents(
 		return nil, err
 	}
 
-	events := make(chan Event, 64)
 	runDone := make(chan struct{})
-	sink := eventSink{ch: events, done: runDone}
-	runCtx := withEmitter(withTrace(ctx, a.traceHook), sink.emit)
-
 	out, writer := schema.Pipe[Event](64)
-
-	// 单一写入者：把内部事件通道转发到 Eino 流，保证 Send 串行。
-	go drainEvents(writer, events, runDone)
+	sink := eventSink{writer: writer, done: runDone}
+	runCtx := withEmitter(withTrace(ctx, a.traceHook), sink.emit)
 
 	// 失败收尾：发 EventError 与 EventDone，保持"Done 总是最后一个事件"的契约。
 	fail := func(err error) {
@@ -147,6 +162,9 @@ func (a *Agent) ChatStreamEvents(
 	go func() {
 		defer a.turn.end()
 		defer close(runDone)
+		// Done 是最后一个事件（fail 路径同理），返回后由 defer 关闭 writer；
+		// 此后迟到的生产者事件经 sink 的 done 双检丢弃。
+		defer writer.Close()
 
 		// inner.Stream 在后台调用：eino ReAct 的 Stream 会同步跑完
 		// 首轮模型推理与工具调用才返回首个分片，若在此同步等待，
@@ -212,33 +230,4 @@ func (a *Agent) ChatStreamEvents(
 	}()
 
 	return out, nil
-}
-
-// drainEvents 转发事件直到本轮结束，并丢弃消费方关闭后的事件。
-func drainEvents(writer *schema.StreamWriter[Event], events <-chan Event, runDone <-chan struct{}) {
-	defer writer.Close()
-
-	var closed bool
-	forward := func(ev Event) {
-		if closed {
-			return
-		}
-		closed = writer.Send(ev, nil)
-	}
-
-	for {
-		select {
-		case ev := <-events:
-			forward(ev)
-		case <-runDone:
-			for {
-				select {
-				case ev := <-events:
-					forward(ev)
-				default:
-					return
-				}
-			}
-		}
-	}
 }
